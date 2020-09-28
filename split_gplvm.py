@@ -4,13 +4,12 @@ import tensorflow_probability as tfp
 
 from typing import Optional, List
 
-from gpflow import covariances, kernels, likelihoods
+from gpflow import covariances, kernels, likelihoods, kullback_leiblers
 from gpflow.base import Parameter
 from gpflow.config import default_float, default_jitter
 from gpflow.expectations import expectation
 from gpflow.inducing_variables import InducingPoints
 from gpflow.kernels import Kernel
-from gpflow.kullback_leiblers import gauss_kl
 from gpflow.mean_functions import MeanFunction, Zero
 from gpflow.probability_distributions import DiagonalGaussian
 from gpflow.utilities import positive, triangular,to_default_float
@@ -32,8 +31,6 @@ class SplitGPLVM(BayesianModel, InternalDataTrainingLossMixin):
         pi: tf.Tensor,
         kernel_K: List[Kernel],
         Zp: tf.Tensor,
-        q_mu=None,
-        q_sqrt=None,
         Xs_mean=None,
         Xs_var=None,
         kernel_s=None,
@@ -56,8 +53,6 @@ class SplitGPLVM(BayesianModel, InternalDataTrainingLossMixin):
         :param kernel_K: private space kernel, one for each category
         :param Zp: inducing inputs of the private space [M, Qp]
         :param num_inducing_variables: number of inducing points, M
-        :param q_mu: mean of the inducing variables U [M, D], i.e m in q(U) ~ N(U | m, S)
-        :param q_sqrt: cholesky of the covariance matrix of the inducing variables [D, M, M]
         :param Xs_mean: mean latent positions in the shared space [N, Qs] (Qs is the dimension of the shared space). i.e. mus in q(Xs) ~ N(Xs | mus, Ss)
         :param Xs_var: variance of latent positions in shared space [N, Qs], i.e. Ss, assumed diagonal
         :param kernel_s: shared space kernel 
@@ -103,21 +98,25 @@ class SplitGPLVM(BayesianModel, InternalDataTrainingLossMixin):
         self.M = len(self.Zp)
 
         # initialize the variational parameters for q(U), same way as in SVGP
-        # q_diag is false because natural gradient only works for full covariance
-        q_mu = np.zeros((self.M, self.D)) if q_mu is None else q_mu
-        self.q_mu = Parameter(q_mu, dtype=default_float())  # [M, D]
+        # q_mu: List[K], mean of the inducing variables U [M, D], i.e m in q(U) ~ N(U | m, S), 
+        #   initialized as zeros
+        # q_sqrt: List[K], cholesky of the covariance matrix of the inducing variables [D, M, M]
+        #   q_diag is false because natural gradient only works for full covariance
+        #   initialized as all identities
+        # we need K sets of q(Uk), each approximating fs+fk
+        self.q_mu = []
+        self.q_sqrt = []
+        for k in range(self.K):
+            q_mu = np.zeros((self.M, self.D))
+            q_mu = Parameter(q_mu, dtype=default_float())  # [M, D]
+            self.q_mu.append(q_mu)
 
-        if q_sqrt is None:
             q_sqrt = [
                 np.eye(self.M, dtype=default_float()) for _ in range(self.D)
             ]
             q_sqrt = np.array(q_sqrt)
-            self.q_sqrt = Parameter(q_sqrt, transform=triangular())  # [D, M, M]
-        else:
-            assert q_sqrt.ndim == 3
-            assert q_sqrt.shape[0] == self.D
-            assert q_sqrt.shape[1] == self.M and q_sqrt.shape[2] == self.M
-            self.q_sqrt = Parameter(q_sqrt, transform=triangular())  # [D, M, M]
+            q_sqrt = Parameter(q_sqrt, transform=triangular())  # [D, M, M]
+            self.q_sqrt.append(q_sqrt)
 
         # deal with parameters for the prior 
         if Xp_prior_mean is None:
@@ -156,12 +155,12 @@ class SplitGPLVM(BayesianModel, InternalDataTrainingLossMixin):
             self.Xs_prior_mean = tf.convert_to_tensor(np.atleast_1d(Xs_prior_mean), dtype=default_float())
             self.Xs_prior_var = tf.convert_to_tensor(np.atleast_1d(Xs_prior_var), dtype=default_float())
 
+        self.Fq = tf.zeros((self.N, self.K), dtype=default_float())
 
 
     # KL[q(x) || p(x)] when both q, p are multivariate normals
     @tf.function
     def kl_mvn(self, X_mean, X_var, X_prior_mean, X_prior_var):
-        # TODO: right now for the covariance of q(U), we are only considering its diagonal elements
         dX_var = (
             X_var
             if X_var.shape.ndims == 2
@@ -189,7 +188,7 @@ class SplitGPLVM(BayesianModel, InternalDataTrainingLossMixin):
         return KL
 
 
-    @tf.function
+    #@tf.function
     def elbo(self) -> tf.Tensor:
         """
         Construct a tensorflow function to compute the bound on the marginal
@@ -292,7 +291,6 @@ class SplitGPLVM(BayesianModel, InternalDataTrainingLossMixin):
         psi1 = tf.stack(psi1, axis=-1)
         psi2 = tf.stack(psi2, axis=-1)
 
-        
         # make K cov_uu_k using Zp and kernel_k
         # K cholesky, repeat N times for later use
         # L is [N x M x M x K]
@@ -308,6 +306,9 @@ class SplitGPLVM(BayesianModel, InternalDataTrainingLossMixin):
         L = repeat_N(L)
         sigma2 = self.likelihood.variance
 
+
+        self.pred_Y = []
+
         # use `tf.vectorized_map` to avoid writing a loop over N, but it requires every matrix to have N on axis 0
         # so we need to repeat certain matrices that are the same for all N (e.g. L)
         # note we can use `tf.vectorized_map` because the computations are decomposable for each n,
@@ -316,35 +317,41 @@ class SplitGPLVM(BayesianModel, InternalDataTrainingLossMixin):
         Yn2 = tf.reduce_sum(tf.square(Y), axis=1)
         for k in range(self.K):
             # compute intermediate matrices for easier computation involving \inv{Kuu}
+            # A is the same as AAT in gplvm, transposing L is the correct thing to do
+            # but the two end up being the same since we only care about the trace
             tmp = tf.vectorized_map(triang_solve, (L[..., k], psi2[..., k])) # [N, M, M]
             A = tf.vectorized_map(triang_solve_transpose, (L[..., k], tmp)) # \inv{Kuu} * Psi2: [N, M, M]
-            
+
             #pos_def = tf.vectorized_map(lambda x: is_pos_def(x), psi2[..., k])
             #print(np.all(pos_def))
             # psi2 is not produced using w/ `covariances.Kuu`, but it should still be PD
             # we should add jitter before doing cholesky
-            jitter_mtx = default_jitter() * tf.eye(self.M, dtype=default_float())
-            LB = tf.vectorized_map(lambda x: tf.linalg.cholesky(x + jitter_mtx), psi2[..., k]) # [N, M, M]   
+            #jitter_mtx = default_jitter() * tf.eye(self.M, dtype=default_float())
+            jitter_mtx = 1e-10 * tf.eye(self.M, dtype=default_float())
+            LB = tf.vectorized_map(lambda x: tf.linalg.cholesky(x + jitter_mtx), psi2[..., k]) # [N, M, M]  
             tmp1 = tf.vectorized_map(triang_solve, (L[..., k], LB)) # [N, M, M]
             C = tf.vectorized_map(triang_solve_transpose, (L[..., k], tmp1)) # sqrt(\inv{Kuu} * Psi2 * \inv{Kuu}): [N, M, M]
 
-            D = tf.vectorized_map(matmul_vectorized, (repeat_N(tf.transpose(self.q_mu)), C)) # sqrt(M^T * \inv{Kuu} * Psi2 * \inv{Kuu} * M): [N, M, D]
+            D = tf.vectorized_map(matmul_vectorized, (repeat_N(tf.transpose(self.q_mu[k])), C)) # sqrt(M^T * \inv{Kuu} * Psi2 * \inv{Kuu} * M): [N, D, M]
 
-            tmp2 = tf.vectorized_map(triang_solve, (L[..., k], repeat_N(self.q_mu)))
+            tmp2 = tf.vectorized_map(triang_solve, (L[..., k], repeat_N(self.q_mu[k])))
             E = tf.vectorized_map(triang_solve_transpose, (L[..., k], tmp2)) # \inv{Kuu} * M: [N, M, D]
 
             # q_sqrt is already the cholesky
-            F = tf.vectorized_map(matmul_vectorized, (repeat_N(tf.transpose(self.q_sqrt, perm=[0, 2, 1])), C)) # sqrt(S * \inv{Kuu} * Psi2 * \inv{Kuu}): [N, D, M, M]
+            F = tf.vectorized_map(matmul_vectorized, (repeat_N(tf.transpose(self.q_sqrt[k], perm=[0, 2, 1])), C)) # sqrt(S * \inv{Kuu} * Psi2 * \inv{Kuu}): [N, D, M, M]
 
             tmp3 = tf.vectorized_map(row_outer_product, (Y, psi1[..., k])) # Y^T * Psi1: [N, D, M]
             G = tf.vectorized_map(matmul_vectorized, (tmp3, E)) # Y^T * Psi1 * \inv{Kuu} * M: [N, D, D]
+
+            # for debugging 
+            self.pred_Y.append(tf.reshape(tf.vectorized_map(matmul_vectorized, (tf.expand_dims(psi1[..., k], 1), E)), (self.N, self.D))) # Psi1 * \inv{Kuu} * M: [N, D]
 
             # compute the lower bound
             # each term added here is length-N vector, each entry representing \sum_{d=1}^D Fdnk for a particular n, k
             Fnk = -0.5 * Yn2 / sigma2
             Fnk += tf.vectorized_map(lambda x: trace_tf(x), G) / sigma2
             Fnk += -0.5 * tf.vectorized_map(lambda x: tf.reduce_sum(tf.square(x)), D) / sigma2
-            Fnk += -0.5 * self.D * tf.vectorized_map(lambda x: trace_tf(x), A)  / sigma2 
+            Fnk += 0.5 * self.D * tf.vectorized_map(lambda x: trace_tf(x), A)  / sigma2 
             Fnk += -0.5 * tf.vectorized_map(lambda x: sum_d_trace(x), F) / sigma2
 
             Fq.append(Fnk)
@@ -353,20 +360,28 @@ class SplitGPLVM(BayesianModel, InternalDataTrainingLossMixin):
         # psi0 is already [N, K]
         Fq += -0.5 * self.D * psi0 / sigma2
         Fq += -0.5 * self.D * tf.math.log(2 * np.pi * sigma2)
+
+        # for debugging 
+        self.Fq = Fq
+        self.pred_Y = tf.stack(self.pred_Y, axis=-1) # [N, D, K]
+
         # weight each entry by the mixture responsibility, then sum over N, K
         bound = tf.reduce_sum(Fq * self.pi)
 
         # compute KL 
         KL_p = self.kl_mvn(self.Xp_mean, self.Xp_var, self.Xp_prior_mean, self.Xp_prior_var)
-        # assumes p(U) has identity covariance for each d
-        # simplifies since otherwise we need to compute Kuu, so need to split this KL for different k
-        KL_u = gauss_kl(self.q_mu, self.q_sqrt)
         KL_c = self.kl_categorical(self.pi, self.pi_prior)
-        bound += - KL_p - KL_u - KL_c
+        KL_u = 0
+        prior_Kuu = np.zeros((self.M, self.M))
         if self.split_space:
             KL_s = self.kl_mvn(self.Xs_mean, self.Xs_var, self.Xs_prior_mean, self.Xs_prior_var)
             bound += - KL_s
-        
+            prior_Kuu += covariances.Kuu(self.Zs, self.kernel_s, jitter=default_jitter())
+        for k in range(self.K):
+            prior_Kuu_k = covariances.Kuu(self.Zp, self.kernel_K[k], jitter=default_jitter())
+            KL_u += kullback_leiblers.gauss_kl(q_mu=self.q_mu[k], q_sqrt=self.q_sqrt[k], K=prior_Kuu+prior_Kuu_k)
+        bound += - KL_p - KL_u - KL_c
+
         return bound
         
 
