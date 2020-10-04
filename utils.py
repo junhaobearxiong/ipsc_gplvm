@@ -18,6 +18,9 @@ from split_gplvm import SplitGPLVM
 from test_gplvm import TestGPLVM
 
 
+'''
+    Simulations
+'''
 def breakpoint_linear(x, ts, k1, k2, c1, sigma):
     '''Function representing a step-wise linear curve with one
     breakpoint located at ts.
@@ -92,34 +95,41 @@ def gen_Y_single_kernel(X, dim, kernel, obs_noise):
     return Y
 
 
-def plot_Y(Y, X, labels, Z=None):
-    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+# generalized the bgp kernel in the following ways:
+# 1. all points before branch point xp are constrained to be the same for the 2 GPs
+# 2. X is [N, D] D >= 1, and Y is [N, dim], dim >= 1
+# 3. Allow constraining based on only the first dimension of X
+#   i.e. f(x) = g(x) for all x where x[0] < xp[0]
+def bgp_kernel(X, xp, dim, x1_only=True):
+    num_data = X.shape[0]
+    kernel = gpflow.kernels.SquaredExponential(lengthscales=[1.0])
+    Kff = kernel(X)
+    if x1_only:
+        mask = (X < xp)[:, 0]
+    else:
+        mask = np.all(X < xp, axis=1)
+    Xs = X[mask, :]
+    Kxu = kernel(X, Xs)
+    Kuu = kernel(Xs)
+    jitter_mtx = 1e-6 * np.eye(Xs.shape[0])
+    L = tf.linalg.cholesky(Kuu + jitter_mtx)
+    tmp = tf.linalg.triangular_solve(L, tf.transpose(Kxu))
+    Kfg = tf.transpose(tmp) @ tmp
 
-    sns.scatterplot(x=X[:, 0], y=X[:, 1], hue=labels, ax=axs[0])
-    if Z is not None:
-        sns.scatterplot(x=Z[:, 0], y=Z[:, 1], color='m', ax=axs[0])
-    sns.scatterplot(x=Y[:, 0], y=Y[:, 1], hue=labels, ax=axs[1])
-    sns.scatterplot(x=Y[:, 0], y=Y[:, 1], hue=X[:, 0], ax=axs[2])
+    tmp1 = tf.concat([Kff, Kfg], axis=0)
+    tmp2 = tf.concat([Kfg, Kff], axis=0)
+    Sigma = tf.concat([tmp1, tmp2], axis=1)
 
-    axs[0].set_title('Latent space')
-    axs[0].set_xlabel('x1')
-    axs[0].set_ylabel('x2')
-
-    axs[1].set_title('Observed space: 2D, color by labels')
-    axs[1].set_xlabel('y1')
-    axs[1].set_ylabel('y2')
-
-    axs[2].set_title('Observed space: 2D, color by x1')
-    axs[2].set_xlabel('y1')
-    axs[2].set_ylabel('y2')
+    y = np.random.default_rng().multivariate_normal(np.zeros(num_data * 2), Sigma, dim).T
+    fx = y[:num_data]
+    gx = y[num_data:]
+    
+    return (fx, gx)
 
 
-def plot_kernel_samples(k, ax, xmin=-3, xmax=3):
-    xx = np.linspace(xmin, xmax, 100)[:, None]
-    K = k(xx)
-    ax.plot(xx, np.random.multivariate_normal(np.zeros(100), K, 3).T)
-
-
+'''
+    Model initialization
+'''
 def init_gplvm(Y, latent_dim, kernel, num_inducing=None, inducing_variable=None, X_mean_init=None, X_var_init=None):
     num_data = Y.shape[0]  # number of data points
 
@@ -175,7 +185,7 @@ def init_test_gplvm(Y, latent_dim, kernel, num_inducing=None, inducing_variable=
 
 
 def init_split_gplvm(Y, split_space, Qp, K, kernel_K=None, M=None, Xp_mean_init=None, Xp_var_init=None,
-    Zp=None, Zs=None, pi_init=None, Qs=None):
+    Zp=None, Zs=None, pi_init=None, Qs=None, Xs_mean_init=None, Xs_var_init=None):
     N = Y.shape[0]  # number of data points
     if split_space:
         assert Qs is not None, 'if split_space, need to speficy Qs'
@@ -202,11 +212,13 @@ def init_split_gplvm(Y, split_space, Qp, K, kernel_K=None, M=None, Xp_mean_init=
         Zp = tf.convert_to_tensor(np.random.permutation(Xp_mean_init.numpy())[:M], dtype=default_float())
 
     if pi_init is None:
-        pi_init = tf.ones((N, K), dtype=default_float())
+        pi_init=tf.constant(np.random.dirichlet(alpha=[2, 2], size=(X.shape[0])), dtype=default_float())
 
     if split_space:
-        Xs_mean_init = tf.constant(X_pca[:, :Qs], dtype=default_float())
-        Xs_var_init = tf.ones((N, Qs), dtype=default_float())
+        if Xs_mean_init is None:
+            Xs_mean_init = tf.constant(X_pca[:, :Qs], dtype=default_float())
+        if Xs_var_init is None:
+            Xs_var_init = tf.ones((N, Qs), dtype=default_float())
         if Zs is None:
             Zs = tf.convert_to_tensor(np.random.permutation(Xs_mean_init.numpy())[:M], dtype=default_float())
         kernel_s = gpflow.kernels.SquaredExponential(lengthscales=tf.convert_to_tensor([1.0] * Qs, dtype=default_float()))
@@ -237,6 +249,9 @@ def init_split_gplvm(Y, split_space, Qp, K, kernel_K=None, M=None, Xp_mean_init=
     return model
 
 
+'''
+    Optimization
+'''
 def train_scipy(m, maxiter=2000, step=True):
     log_elbo = []
     # log_pi = []
@@ -269,7 +284,6 @@ def train_scipy(m, maxiter=2000, step=True):
     return log_elbo
         
 
-
 def train_natgrad_adam(model, num_iterations=2000, log_freq=10):
     
     natgrad_opt = NaturalGradient(gamma=1.0)
@@ -282,11 +296,11 @@ def train_natgrad_adam(model, num_iterations=2000, log_freq=10):
     def optimization_step():
         natgrad_opt.minimize(model.training_loss, var_list=variational_params)
         adam_opt.minimize(model.training_loss, var_list=model.trainable_variables)
-        return (model.elbo(), model.Fq)
-        #return model.elbo()
+        #return (model.elbo(), model.Fq)
+        return model.elbo()
 
     log_elbo = []
-    log_Fq = []
+    #log_Fq = []
     # log_predY = []
     tol = 1e-4
 
@@ -294,10 +308,10 @@ def train_natgrad_adam(model, num_iterations=2000, log_freq=10):
 
     for step in range(num_iterations):
         start_time = time.time()
-        elbo, Fq = optimization_step()
-        #elbo = optimization_step()
+        #elbo, Fq = optimization_step()
+        elbo = optimization_step()
         log_elbo.append(elbo)
-        log_Fq.append(Fq.numpy())
+        #log_Fq.append(Fq.numpy())
         # log_predY.append(pred_Y.numpy())
 
         if step > 0 and np.abs(elbo - log_elbo[-2]) < tol:
@@ -306,5 +320,66 @@ def train_natgrad_adam(model, num_iterations=2000, log_freq=10):
         if (step + 1)  % log_freq == 0:
             print('iteration {} elbo {:.4f}, took {:.4f}s'.format(step+1, elbo, time.time()-start_time))
             
-    return (log_elbo, log_Fq)
-    #return log_elbo
+    #return (log_elbo, log_Fq)
+    return log_elbo
+
+
+'''
+    Debugging
+'''
+# first compute the predicted observation by each of the K mixture: [N, D, K]
+# then weight each mixture prediction by the mixture weight
+# resulting in [N, D]
+def get_pred_Y(m, by_K=False):
+    pred_Y = np.zeros((m.N, m.D))
+
+    if by_K:
+        pred_Y_k = np.zeros((m.N, m.D, m.K))
+
+    if m.split_space:
+        kernel = m.kernel_s
+        Kmm_s = gpflow.covariances.Kuu(m.Zs, kernel, jitter=gpflow.default_jitter())
+        Kmn_s = gpflow.covariances.Kuf(m.Zs, kernel, m.Xs_mean)    
+
+    # fk(xk)
+    for k in range(m.K):
+        kernel = m.kernel_K[k]
+        Kmm = gpflow.covariances.Kuu(m.Zp, kernel, jitter=gpflow.default_jitter())
+        Kmn = gpflow.covariances.Kuf(m.Zp, kernel, m.Xp_mean)
+        if m.split_space:
+            Kmm += Kmm_s
+            Kmn += Kmn_s
+        pred = tf.transpose(Kmn) @ tf.linalg.inv(Kmm) @ m.q_mu[k] # [N, D]
+        if by_K:
+            pred_Y_k[..., k] = pred.numpy()
+        assignment = m.pi.numpy()[:, k]
+        pred_Y += pred.numpy() * np.stack([assignment for _ in range(m.D)], axis=1)
+
+    if by_K:
+        return pred_Y, pred_Y_k
+    else:
+        return pred_Y
+
+
+def klu(m):
+    KL_u = 0
+    prior_Kuu = np.zeros((m.M, m.M))
+    if m.split_space:
+        prior_Kuu += gpflow.covariances.Kuu(m.Zs, m.kernel_s, jitter=gpflow.default_jitter())
+    for k in range(2):
+        prior_Kuu_k = gpflow.covariances.Kuu(m.Zp, m.kernel_K[k], jitter=gpflow.default_jitter())
+        KL_u += gpflow.kullback_leiblers.gauss_kl(q_mu=m.q_mu[k], q_sqrt=m.q_sqrt[k], K=prior_Kuu+prior_Kuu_k)
+    return KL_u
+
+
+def klc(m):
+    return m.kl_categorical(m.pi, m.pi_prior)
+
+
+def klxp(m):
+    return m.kl_mvn(m.Xp_mean, m.Xp_var, m.Xp_prior_mean, m.Xp_prior_var)
+
+
+def klxs(m):
+    return m.kl_mvn(m.Xs_mean, m.Xs_var, m.Xs_prior_mean, m.Xs_prior_var)
+

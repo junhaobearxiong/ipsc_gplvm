@@ -188,7 +188,7 @@ class SplitGPLVM(BayesianModel, InternalDataTrainingLossMixin):
         return KL
 
 
-    #@tf.function
+    @tf.function
     def elbo(self) -> tf.Tensor:
         """
         Construct a tensorflow function to compute the bound on the marginal
@@ -307,7 +307,7 @@ class SplitGPLVM(BayesianModel, InternalDataTrainingLossMixin):
         sigma2 = self.likelihood.variance
 
 
-        self.pred_Y = []
+        # self.pred_Y = []
 
         # use `tf.vectorized_map` to avoid writing a loop over N, but it requires every matrix to have N on axis 0
         # so we need to repeat certain matrices that are the same for all N (e.g. L)
@@ -344,7 +344,7 @@ class SplitGPLVM(BayesianModel, InternalDataTrainingLossMixin):
             G = tf.vectorized_map(matmul_vectorized, (tmp3, E)) # Y^T * Psi1 * \inv{Kuu} * M: [N, D, D]
 
             # for debugging 
-            self.pred_Y.append(tf.reshape(tf.vectorized_map(matmul_vectorized, (tf.expand_dims(psi1[..., k], 1), E)), (self.N, self.D))) # Psi1 * \inv{Kuu} * M: [N, D]
+            # self.pred_Y.append(tf.reshape(tf.vectorized_map(matmul_vectorized, (tf.expand_dims(psi1[..., k], 1), E)), (self.N, self.D))) # Psi1 * \inv{Kuu} * M: [N, D]
 
             # compute the lower bound
             # each term added here is length-N vector, each entry representing \sum_{d=1}^D Fdnk for a particular n, k
@@ -362,8 +362,8 @@ class SplitGPLVM(BayesianModel, InternalDataTrainingLossMixin):
         Fq += -0.5 * self.D * tf.math.log(2 * np.pi * sigma2)
 
         # for debugging 
-        self.Fq = Fq
-        self.pred_Y = tf.stack(self.pred_Y, axis=-1) # [N, D, K]
+        #self.Fq = Fq
+        # self.pred_Y = tf.stack(self.pred_Y, axis=-1) # [N, D, K]
 
         # weight each entry by the mixture responsibility, then sum over N, K
         bound = tf.reduce_sum(Fq * self.pi)
