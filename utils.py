@@ -14,7 +14,7 @@ from gpflow.models import gplvm
 from gpflow.optimizers import NaturalGradient
 from gpflow import set_trainable
 
-from split_gplvm import SplitGPLVM
+from split_gplvm import SplitGPLVM, SplitGPLVMApprox
 from test_gplvm import TestGPLVM
 
 
@@ -184,7 +184,7 @@ def init_test_gplvm(Y, latent_dim, kernel, num_inducing=None, inducing_variable=
     return model
 
 
-def init_split_gplvm(Y, split_space, Qp, K, kernel_K=None, M=None, Xp_mean_init=None, Xp_var_init=None,
+def init_split_gplvm(Y, split_space, Qp, K, approx=False, kernel_K=None, M=None, Xp_mean_init=None, Xp_var_init=None,
     Zp=None, Zs=None, pi_init=None, Qs=None, Xs_mean_init=None, Xs_var_init=None):
     N = Y.shape[0]  # number of data points
     if split_space:
@@ -235,6 +235,19 @@ def init_split_gplvm(Y, split_space, Qp, K, kernel_K=None, M=None, Xp_mean_init=
             kernel_s=kernel_s,
             Zs=Zs,
         )
+        if approx:
+            model = SplitGPLVMApprox(
+                data=Y,
+                Xp_mean=Xp_mean_init,
+                Xp_var=Xp_var_init,
+                pi=pi_init,
+                kernel_K=kernel_K,
+                Zp=Zp,
+                Xs_mean=Xs_mean_init,
+                Xs_var=Xs_var_init,
+                kernel_s=kernel_s,
+                Zs=Zs,
+            )
     else:
         model = SplitGPLVM(
             data=Y,
@@ -284,13 +297,17 @@ def train_scipy(m, maxiter=2000, step=True):
     return log_elbo
         
 
-def train_natgrad_adam(model, num_iterations=2000, log_freq=10):
+def train_natgrad_adam(model, approx=False, num_iterations=2000, log_freq=10):
     
     natgrad_opt = NaturalGradient(gamma=1.0)
     adam_opt = tf.optimizers.Adam(learning_rate=0.01)
     variational_params = list(zip(model.q_mu, model.q_sqrt))
     gpflow.set_trainable(model.q_mu, False)
     gpflow.set_trainable(model.q_sqrt, False)
+    if approx:
+        variational_params.append((model.q_mu_s, model.q_sqrt_s))
+        gpflow.set_trainable(model.q_mu_s, False)
+        gpflow.set_trainable(model.q_sqrt_s, False)
 
     @tf.function
     def optimization_step():
@@ -357,6 +374,35 @@ def get_pred_Y(m, by_K=False):
 
     if by_K:
         return pred_Y, pred_Y_k
+    else:
+        return pred_Y
+
+
+def get_pred_Y_approx(m, by_K=False):
+    pred_Y = np.zeros((m.N, m.D))
+
+    if by_K:
+        pred_Y_k = np.zeros((m.N, m.D, m.K))
+
+    # fs(xk)
+    Kmm_s = gpflow.covariances.Kuu(m.Zs, m.kernel_s, jitter=gpflow.default_jitter())
+    Kmn_s = gpflow.covariances.Kuf(m.Zs, m.kernel_s, m.Xs_mean) 
+    pred_s = (tf.transpose(Kmn_s) @ tf.linalg.inv(Kmm_s) @ m.q_mu_s).numpy()
+
+    # fk(xk)
+    for k in range(m.K):
+        kernel = m.kernel_K[k]
+        Kmm = gpflow.covariances.Kuu(m.Zp, kernel, jitter=gpflow.default_jitter())
+        Kmn = gpflow.covariances.Kuf(m.Zp, kernel, m.Xp_mean)
+        pred = tf.transpose(Kmn) @ tf.linalg.inv(Kmm) @ m.q_mu[k] # [N, D]
+        if by_K:
+            pred_Y_k[..., k] = pred.numpy()
+        assignment = m.pi.numpy()[:, k]
+        pred_Y += pred.numpy() * np.stack([assignment for _ in range(m.D)], axis=1)
+    pred_Y += pred_s
+
+    if by_K:
+        return pred_Y, pred_Y_k, pred_s
     else:
         return pred_Y
 
