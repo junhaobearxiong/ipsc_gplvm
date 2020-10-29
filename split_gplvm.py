@@ -188,7 +188,7 @@ class SplitGPLVM(BayesianModel, InternalDataTrainingLossMixin):
         return KL
 
 
-    #@tf.function
+    @tf.function
     def elbo(self) -> tf.Tensor:
         """
         Construct a tensorflow function to compute the bound on the marginal
@@ -389,6 +389,7 @@ class SplitGPLVM(BayesianModel, InternalDataTrainingLossMixin):
     def maximum_log_likelihood_objective(self) -> tf.Tensor:
         return self.elbo()
 
+
 # Split GPLVM with a separate approximation for fs and fk
 # assumes split_space = True, otherwise this is equivalent to SplitGPLVM
 class SplitGPLVMApprox(SplitGPLVM):
@@ -501,10 +502,7 @@ class SplitGPLVMApprox(SplitGPLVM):
         Ls = repeat_N(Ls) # [N x M x M]
 
         # loop over k, for each k use kernel_K[k] and qXp, compute psi0k, psi1k, psi2k, then store the psi statistics for all k together
-        # for each k: if no shared space, then psi0[:, k] = psi0k, psi1[:, :, k] = psi1k, psi2[:, :, :, k] = psi2k
-        # if have shared space, then psi0[:, k] = psi0s + psi0k, psi1[:, :, k] = psi1s + psi1k
-        # psi2[:, :, :, k] = psi2s + psi2k (the cross terms are added later)
-        # then, for each n, psi2[n, :, :, k] = psi1s[n, :]^T dot psi1k[n, :] + psi1k[n, :]^T dot psi1s[n, :] (both are [M, M])
+        # for each k: psi0[:, k] = psi0k, psi1[:, :, k] = psi1k, psi2[:, :, :, k] = psi2k
         # psi0 is [N, K] so psi0[n, k] gives a real value
         # psi1 is [N, M, K], so psi1[n, :, k] gives us a M-vector
         # psi2 is [N, M, M, K], so psi2[n, :, :, k] gives us a [M x M] matrix

@@ -1,7 +1,11 @@
 import numpy as np
 import gpflow
 import tensorflow as tf
+import pandas as pd
+
 from sklearn.decomposition import PCA
+from sklearn.metrics import explained_variance_score
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -40,67 +44,12 @@ def branch_simulation(x, break_pt, k1, k21, k22, c1, sigma):
     return X #(X - X.mean()) / X.std()
 
 
-# generate high dimensional observation Y ([num_data, dim])
-# by mapping X to dim-dimensional space through a GP w/ kernel function
-def gen_obs(X, split_space, labels, dim, lengthscales, obs_noise=1):
-    N = X.shape[0]
-    Y = np.zeros([N, dim])
-    
-    k1 = gpflow.kernels.SquaredExponential(lengthscales=lengthscales[0])
-    k2 = gpflow.kernels.SquaredExponential(lengthscales=lengthscales[1])
-    
-    label_counts = np.unique(labels, return_counts=True)[1]
-    
-    # y = fs(x1) + fk(x2), where k depends on the label of x
-    # each fk has a different lengthscale
-    if split_space:
-        k3 = gpflow.kernels.SquaredExponential(lengthscales=lengthscales[2])
-        # fs(x1)
-        Y += np.random.default_rng().multivariate_normal(np.zeros(N), k3(X[:, 0][:, np.newaxis]), dim).T
-        # fk(x2), k=1
-        Y[labels == 0, :] += np.random.default_rng().multivariate_normal(np.zeros(label_counts[0]), 
-                                                                       k1(X[labels == 0, 1][:, np.newaxis]), dim).T
-        # fk(x2), k=2
-        Y[labels == 1, :] += np.random.default_rng().multivariate_normal(np.zeros(label_counts[1]),
-                                                                       k2(X[labels == 1, 1][:, np.newaxis]), dim).T
-    else:
-        # fk(x), k=1
-        Y[labels == 0, :] += np.random.default_rng().multivariate_normal(np.zeros(label_counts[0]), k1(X[labels == 0, :]), dim).T
-        # fk(x), k=2
-        Y[labels == 1, :] += np.random.default_rng().multivariate_normal(np.zeros(label_counts[1]), k2(X[labels == 1, :]), dim).T
-    # add observational noise
-    Y += np.random.normal(0, np.sqrt(obs_noise), Y.shape)
-    return Y #(Y - Y.mean()) / Y.std()
-
-
-def gen_Y(X, labels, dim, kernels, obs_noise=0):
-    N = X.shape[0]
-    Y = np.zeros([N, dim])
-    
-    label_counts = np.unique(labels, return_counts=True)[1]
-    # fk(x), k=1
-    Y[labels == 0, :] += np.random.default_rng().multivariate_normal(np.zeros(label_counts[0]), 
-                                                                     kernels[0](X[labels == 0, :]), dim).T
-    # fk(x), k=2
-    Y[labels == 1, :] += np.random.default_rng().multivariate_normal(np.zeros(label_counts[1]), 
-                                                                     kernels[1](X[labels == 1, :]), dim).T
-    # add observational noise
-    Y += np.random.normal(0, np.sqrt(obs_noise), Y.shape)
-    return Y
-
-
-def gen_Y_single_kernel(X, dim, kernel, obs_noise):
-    Y = np.random.default_rng().multivariate_normal(np.zeros(X.shape[0]), kernel(X), dim).T
-    Y += np.random.normal(0, np.sqrt(obs_noise), Y.shape)
-    return Y
-
-
 # generalized the bgp kernel in the following ways:
 # 1. all points before branch point xp are constrained to be the same for the 2 GPs
 # 2. X is [N, D] D >= 1, and Y is [N, dim], dim >= 1
 # 3. Allow constraining based on only the first dimension of X
 #   i.e. f(x) = g(x) for all x where x[0] < xp[0]
-def bgp_kernel(X, xp, dim, x1_only=True):
+def branch_kernel(X, xp, dim, x1_only=True):
     num_data = X.shape[0]
     kernel = gpflow.kernels.SquaredExponential(lengthscales=[1.0])
     Kff = kernel(X)
@@ -127,16 +76,50 @@ def bgp_kernel(X, xp, dim, x1_only=True):
     return (fx, gx)
 
 
+def gen_sim(num_data, dim):
+    np.random.seed(1)
+
+    xmin = -5
+    xmax = 5
+    break_pt = xmin + (xmax - xmin) * 0.5
+    k1 = 0.0
+    k21 = 0.5
+    k22 = -0.5
+    c1 = 0
+    sigma = 0
+
+    x = np.linspace(xmin, xmax, int(num_data/2), dtype=default_float())
+    X = branch_simulation(x, break_pt, k1, k21, k22, c1, sigma)
+    labels = np.repeat([0, 1], int(num_data)/2)
+
+    fx, gx = branch_kernel(X, break_pt, dim)
+
+    break_num = x[x < break_pt].size
+    halfpt = int(num_data / 2)
+    tmp1 = fx[:break_num]
+    tmp2 = fx[break_num:halfpt]
+    tmp3 = gx[-(halfpt-break_num):]
+    Y = np.concatenate([tmp1, tmp2, tmp1, tmp3], axis=0)
+
+    return (X, Y, labels)
+
 '''
     Model initialization
 '''
-def init_gplvm(Y, latent_dim, kernel, num_inducing=None, inducing_variable=None, X_mean_init=None, X_var_init=None):
+def init_gplvm(Y, latent_dim, kernel=None, num_inducing=None, inducing_variable=None, X_mean_init=None, X_var_init=None):
     num_data = Y.shape[0]  # number of data points
 
     if X_mean_init is None:
         X_mean_init = tf.constant(PCA(n_components=latent_dim).fit_transform(Y), dtype=default_float())
+    else:
+        X_mean_init = tf.constant(X_mean_init, dtype=default_float())
     if X_var_init is None:
         X_var_init = tf.ones((num_data, latent_dim), dtype=default_float())
+    else:
+        X_var_init = tf.constant(X_var_init, dtype=default_float())
+
+    if kernel is None:
+        kernel = gpflow.kernels.SquaredExponential(lengthscales=[1.0]*latent_dim)
 
     if (inducing_variable is None) == (num_inducing is None):
         raise ValueError(
@@ -162,8 +145,12 @@ def init_test_gplvm(Y, latent_dim, kernel, num_inducing=None, inducing_variable=
 
     if X_mean_init is None:
         X_mean_init = tf.constant(PCA(n_components=latent_dim).fit_transform(Y), dtype=default_float())
+    else:
+        X_mean_init = tf.constant(X_mean_init, dtype=default_float())
     if X_var_init is None:
         X_var_init = tf.ones((num_data, latent_dim), dtype=default_float())
+    else:
+        X_var_init = tf.constant(X_var_init, dtype=default_float())
 
     if (inducing_variable is None) == (num_inducing is None):
         raise ValueError(
@@ -185,7 +172,8 @@ def init_test_gplvm(Y, latent_dim, kernel, num_inducing=None, inducing_variable=
 
 
 def init_split_gplvm(Y, split_space, Qp, K, approx=False, kernel_K=None, M=None, Xp_mean_init=None, Xp_var_init=None,
-    Zp=None, Zs=None, pi_init=None, Qs=None, Xs_mean_init=None, Xs_var_init=None):
+    Zp=None, Zs=None, pi_init=None, Qs=None, Xs_mean_init=None, Xs_var_init=None,
+    Xs_prior_var=None, Xp_prior_var=None):
     N = Y.shape[0]  # number of data points
     if split_space:
         assert Qs is not None, 'if split_space, need to speficy Qs'
@@ -212,7 +200,7 @@ def init_split_gplvm(Y, split_space, Qp, K, approx=False, kernel_K=None, M=None,
         Zp = tf.convert_to_tensor(np.random.permutation(Xp_mean_init.numpy())[:M], dtype=default_float())
 
     if pi_init is None:
-        pi_init=tf.constant(np.random.dirichlet(alpha=[2, 2], size=(X.shape[0])), dtype=default_float())
+        pi_init=tf.constant(np.random.dirichlet(alpha=[2 for _ in range(K)], size=(N)), dtype=default_float())
 
     if split_space:
         if Xs_mean_init is None:
@@ -234,6 +222,8 @@ def init_split_gplvm(Y, split_space, Qp, K, approx=False, kernel_K=None, M=None,
             Xs_var=Xs_var_init,
             kernel_s=kernel_s,
             Zs=Zs,
+            Xp_prior_var=Xp_prior_var,
+            Xs_prior_var=Xs_prior_var
         )
         if approx:
             model = SplitGPLVMApprox(
@@ -247,6 +237,8 @@ def init_split_gplvm(Y, split_space, Qp, K, approx=False, kernel_K=None, M=None,
                 Xs_var=Xs_var_init,
                 kernel_s=kernel_s,
                 Zs=Zs,
+                Xp_prior_var=Xp_prior_var,
+                Xs_prior_var=Xs_prior_var
             )
     else:
         model = SplitGPLVM(
@@ -256,7 +248,8 @@ def init_split_gplvm(Y, split_space, Qp, K, approx=False, kernel_K=None, M=None,
             Xp_var=Xp_var_init,
             pi=pi_init,
             kernel_K=kernel_K,
-            Zp=Zp
+            Zp=Zp,
+            Xp_prior_var=Xp_prior_var
         )
     
     return model
@@ -340,6 +333,30 @@ def train_natgrad_adam(model, approx=False, num_iterations=2000, log_freq=10):
     #return (log_elbo, log_Fq)
     return log_elbo
 
+
+def train_adam(model, num_iterations=2000, log_freq=10):
+    adam_opt = tf.optimizers.Adam(learning_rate=0.01)
+
+    @tf.function
+    def optimization_step():
+        adam_opt.minimize(model.training_loss, var_list=model.trainable_variables)
+        return model.elbo()
+
+    log_elbo = []
+    tol = 1e-4
+
+    print('initial elbo {:.4f}'.format(model.elbo()))
+
+    for step in range(num_iterations):
+        start_time = time.time()
+        elbo = optimization_step()
+        log_elbo.append(elbo)
+        if step > 0 and np.abs(elbo - log_elbo[-2]) < tol:
+            print('converge at iteration {} elbo {:.4f}'.format(step+1, elbo))
+            break
+        if (step + 1)  % log_freq == 0:
+            print('iteration {} elbo {:.4f}, took {:.4f}s'.format(step+1, elbo, time.time()-start_time))
+    return log_elbo
 
 '''
     Debugging
@@ -428,4 +445,27 @@ def klxp(m):
 
 def klxs(m):
     return m.kl_mvn(m.Xs_mean, m.Xs_var, m.Xs_prior_mean, m.Xs_prior_var)
+
+
+def calc_VE_fs(Y, Fs):
+    sample_VE = np.zeros((Y.shape[0]))
+    for n in range(Y.shape[0]):
+        y = Y[n, :]
+        fs = Fs[n, :]
+        sample_VE[n] = explained_variance_score(y_true=y, y_pred=fs)
+    sample_VE[sample_VE < 0] = 0
+    return sample_VE
+
+
+def calc_VE_fk(Y, Fk):
+    N = Y.shape[0]
+    K = Fk.shape[-1]
+    sample_VE = np.zeros((N, K))
+    for n in range(N):
+        for k in range(K):
+            y = Y[n, :]
+            fk = Fk[n, :, k]
+            sample_VE[n, k] = explained_variance_score(y_true=y, y_pred=fk)
+    sample_VE[sample_VE < 0] = 0
+    return sample_VE
 
