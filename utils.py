@@ -469,3 +469,39 @@ def calc_VE_fk(Y, Fk):
     sample_VE[sample_VE < 0] = 0
     return sample_VE
 
+'''
+    MPPCA
+'''
+def get_X_mppca(Y, W, R, mu):
+    N = Y.shape[0]
+    D = W.shape[-1] # number of latent dimensions
+    K = W.shape[0]
+    # [N, D, K]
+    X = np.zeros((N, D, K))
+    # iterate over each component
+    for k in range(K):
+        # embedding based on the ith component
+        mean = np.concatenate([mu[k, :][None, :] for _ in range(N)], axis=0)
+        Xk = np.dot(Y - mean, W[k, ...])
+        # each dimension of X is weighted by responsibility for the kth compoenent
+        weights = np.concatenate([R[:, k][:, None] for _ in range(D)], axis=1)
+        Xk *= weights
+        X[..., k] = Xk
+    X = np.sum(X, axis=-1)
+    return X
+
+
+def get_pred_mppca(mppcaX, W, R, mu):
+    N = mppcaX.shape[0]
+    D = W.shape[1] # number of observed dimensions
+    K = W.shape[0]
+    pred = np.zeros((N, D, K))
+    for k in range(K):
+        mean = np.concatenate([mu[k, :][None, :] for _ in range(N)], axis=0)
+        #predk = np.dot(mppcaX, np.transpose(W[k, ...])) + mean
+        predk = np.transpose(W[k, ...] @ np.linalg.inv(np.transpose(W[k, ...]) @ W[k, ...]) @ np.transpose(mppcaX)) + mean
+        weights = np.concatenate([R[:, k][:, None] for _ in range(D)], axis=1)
+        predk *= weights
+        pred[..., k] = predk
+    pred = np.sum(pred, axis=-1)
+    return pred

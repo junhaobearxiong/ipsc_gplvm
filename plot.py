@@ -5,6 +5,7 @@ import gpflow
 import numpy as np
 
 from sklearn.metrics import r2_score
+from sklearn.decomposition import PCA
 
     
 def plot_qmu(m):
@@ -48,14 +49,20 @@ def plot_Fq_list(Fq, num_data=200):
     plt.tight_layout()
     
 
-def plot_assignment(m, Xmean, ax):
+def plot_assignment(m, Xmean, ax, title):
     assignment = m.pi.numpy()[:, 0]
     sns.scatterplot(x=Xmean[:, 0], y=Xmean[:, 1], hue=assignment, ax=ax)
+    ax.set_title(title)
+    ax.set_xlabel('true x1')
+    ax.set_ylabel('true x2')
 
 
-def plot_assignment_true_x1(m, x1, ax):
+def plot_assignment_true_x1(m, x1, ax, title):
     assignment = m.pi.numpy()[:, 0]
     ax.scatter(x1, assignment, alpha=0.5)
+    ax.set_title(title)
+    ax.set_xlabel('true x1')
+    ax.set_ylabel('assignment probability for GP 0')
 
 
 def plot_pred_vs_true(Y_true, Y_pred, ax):
@@ -77,7 +84,7 @@ def plot_pred_true_1d(Y_true, Y_pred, dim, ax):
     
 
 def plot_pred_by_K(Y_pred_k, ax):
-    colors = ['r', 'g']
+    colors = ['r', 'g', 'b']
     for k in range(Y_pred_k.shape[-1]):
         pred = Y_pred_k[..., k]
         ax.scatter(pred[:, 0], pred[:, 1], color=colors[k], label='k={}'.format(k), alpha=0.3)
@@ -95,13 +102,37 @@ def plot_predS(pred_s, ax):
     ax.set_title('prediction by mixture')
 
 
-def plot_Y(Y, X, labels, Z=None):
+def plot_embedding(m, X, labels):
+    fig, axs = plt.subplots(1, 4, figsize=(18, 4), sharex=True, sharey=True)
+    if m.split_space:
+        x1 = m.Xs_mean.numpy().flatten()
+        x2 = m.Xp_mean.numpy().flatten()
+        axs[0].set_xlabel('shared')
+        axs[0].set_ylabel('private')
+    else:
+        xmean = m.Xp_mean.numpy()
+        x1 = xmean[:, 0]
+        x2 = xmean[:, 1]
+        axs[0].set_xlabel('private 1')
+        axs[0].set_ylabel('private 2')
+    sns.scatterplot(x=x1, y=x2, hue=labels, ax=axs[0], alpha=0.5)
+    axs[0].set_title('color by true assignment')
+    sns.scatterplot(x=x1, y=x2, hue=m.pi.numpy()[:, 0], ax=axs[1])
+    axs[1].set_title('color by learned assignment')
+    sns.scatterplot(x=x1, y=x2, hue=X[:, 0], ax=axs[2])
+    axs[2].set_title('color by true x1')
+    sns.scatterplot(x=x1, y=x2, hue=X[:, 1], ax=axs[3])
+    axs[3].set_title('color by true x2')
+
+
+
+def plot_Y(Y, X, labels, Z=None, alpha=0.5):
     fig, axs = plt.subplots(1, 3, figsize=(15, 5))
 
-    sns.scatterplot(x=X[:, 0], y=X[:, 1], hue=labels, ax=axs[0], alpha=0.5)
+    sns.scatterplot(x=X[:, 0], y=X[:, 1], hue=labels, ax=axs[0], alpha=alpha)
     if Z is not None:
         sns.scatterplot(x=Z[:, 0], y=Z[:, 1], color='m', ax=axs[0])
-    sns.scatterplot(x=Y[:, 0], y=Y[:, 1], hue=labels, ax=axs[1], alpha=0.5)
+    sns.scatterplot(x=Y[:, 0], y=Y[:, 1], hue=labels, ax=axs[1], alpha=alpha)
     sns.scatterplot(x=Y[:, 0], y=Y[:, 1], hue=X[:, 0], ax=axs[2])
 
     axs[0].set_title('Latent space')
@@ -135,3 +166,77 @@ def plot_fgx(X, xp, fx, gx, d):
         axs[i].set_ylabel('y{}'.format(d))
         axs[i].vlines(x=xp[i], ymin=fx.min(), ymax=fx.max(), color='r', label='xb')
         axs[i].legend()
+
+
+def plot_pca(Y, X, labels):
+    fig, axs = plt.subplots(1, 3, figsize=(14, 4), sharex=True, sharey=True)
+    xmean = PCA(n_components=2).fit_transform(Y)
+    x1 = xmean[:, 0]
+    x2 = xmean[:, 1]
+    sns.scatterplot(x=x1, y=x2, hue=labels, ax=axs[0], alpha=0.5)
+    axs[0].set_title('color by true assignment')
+    sns.scatterplot(x=x1, y=x2, hue=X[:, 0], ax=axs[1])
+    axs[1].set_title('color by true x1')
+    sns.scatterplot(x=x1, y=x2, hue=X[:, 1], ax=axs[2])
+    axs[2].set_title('color by true x2')
+    axs[0].set_xlabel('PC 1')
+    axs[0].set_ylabel('PC 2')
+
+def plot_gplvm(m, X, labels):
+    fig, axs = plt.subplots(1, 3, figsize=(14, 4), sharex=True, sharey=True)
+    xmean = m.X_data_mean.numpy()
+    x1 = xmean[:, 0]
+    x2 = xmean[:, 1]
+    sns.scatterplot(x=x1, y=x2, hue=labels, ax=axs[0], alpha=0.5)
+    axs[0].set_title('color by true assignment')
+    sns.scatterplot(x=x1, y=x2, hue=X[:, 0], ax=axs[1])
+    axs[1].set_title('color by true x1')
+    sns.scatterplot(x=x1, y=x2, hue=X[:, 1], ax=axs[2])
+    axs[2].set_title('color by true x2')
+    axs[0].set_xlabel('latent dimension 1')
+    axs[0].set_ylabel('latent dimension 2')
+
+
+def plot_ve_fk(ve_fk, X, labels):
+    fig, axs = plt.subplots(1, 4, figsize=(20, 4), sharex=True, sharey=True)
+    axs[0].scatter(X[labels==0, 0], ve_fk[labels==0, 0])
+    axs[0].set_title('fk, k=0, blue branch')
+    axs[1].scatter(X[labels==1, 0], ve_fk[labels==1, 0])
+    axs[1].set_title('fk, k=0, orange branch')
+    axs[2].scatter(X[labels==0, 0], ve_fk[labels==0, 1])
+    axs[2].set_title('fk, k=1, blue branch')
+    axs[3].scatter(X[labels==1, 0], ve_fk[labels==1, 1])
+    axs[3].set_title('fk, k=1, orange branch')
+
+    axs[0].set_xlabel('x1')
+    axs[0].set_ylabel('variance explained')
+    for ax in axs:
+        ax.grid()
+
+
+def plot_ve_fs(ve_fs, X, labels):
+    fig, axs = plt.subplots(1, 2, figsize=(10, 4), sharex=True, sharey=True)
+    axs[0].scatter(X[labels==0, 0], ve_fs[labels==0])
+    axs[0].set_title('fs, blue branch')
+    axs[1].scatter(X[labels==1, 0], ve_fs[labels==1])
+    axs[1].set_title('fs, orange branch')
+    axs[0].set_xlabel('x1')
+    axs[0].set_ylabel('variance explained')
+    for ax in axs:
+        ax.grid()
+
+
+def plot_xs_xp(m, X, labels):
+    fig, axs = plt.subplots(1, 2, figsize=(10, 4))
+    xs = m.Xs_mean.numpy().flatten()
+    xp = m.Xp_mean.numpy().flatten()
+
+    axs[0].scatter(X[labels==0, 0], xs[labels==0], label='branch 1', alpha=0.5)
+    axs[0].scatter(X[labels==1, 0], xs[labels==1], label='branch 2', alpha=0.5)
+    axs[0].set_xlabel('true x1')
+    axs[0].set_ylabel('xs')
+
+    axs[1].scatter(X[labels==0, 1], xp[labels==0], label='branch 1', alpha=0.5)
+    axs[1].scatter(X[labels==1, 1], xp[labels==1], label='branch 2', alpha=0.5)
+    axs[1].set_xlabel('true x2')
+    axs[1].set_ylabel('xp')
